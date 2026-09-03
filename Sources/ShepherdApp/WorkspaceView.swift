@@ -3,7 +3,7 @@ import AppKit
 import ShepherdCore
 
 struct WorkspaceView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
 
     /// The frame is the app's one attention surface: neutral hairline
     /// normally, the status color when the focused agent is blocked.
@@ -14,11 +14,13 @@ struct WorkspaceView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                // Every layout stays mounted; switching agents only changes
-                // which one is visible. Unmounting would destroy the Ghostty
-                // views and force a re-attach + full replay on every switch,
-                // which is what made switching flash. Hidden panes keep their
-                // surfaces, scrollback, and their process's real grid.
+                // Every mounted layout stays mounted; switching agents only
+                // changes which one is visible. Unmounting would destroy the
+                // Ghostty views and force a re-attach + full replay on every
+                // switch, which is what made switching flash. Hidden panes
+                // keep their surfaces, scrollback, and their process's real
+                // grid. Space shell layouts join the mounted set on first
+                // visit (see WorkspaceSelection).
                 let mounted = vm.mountedTabs
                 let visibleTabID = vm.activeTabID
                 ForEach(mounted) { tab in
@@ -59,6 +61,9 @@ struct WorkspaceView: View {
 
             StatusLineView(vm: vm)
         }
+        // A lazily mounted space shell must stay mounted once shown;
+        // recording here catches every path that changes the active tab.
+        .onChange(of: vm.activeTabID, initial: true) { vm.noteActiveTabVisited() }
         .background(Tokens.workspaceBg)
         // Window-level file/image drop routing for terminal panes; per-pane
         // SwiftUI .onDrop cannot coexist with permanently mounted hidden
@@ -91,7 +96,7 @@ struct EmptyWorkspaceHint: View {
 /// vertical divider (side-by-side columns), matching the ⌘D-vertical reference
 /// split; `.horizontal` stacks rows.
 struct PaneTreeView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     let tab: Tab
     let node: PaneNode
 
@@ -113,7 +118,7 @@ struct PaneTreeView: View {
 /// never translation: the separator moves during the drag, so translation
 /// measured in its own space compounds error and drifts off the cursor.
 struct PaneSplitView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     let tab: Tab
     let node: PaneNode
     @State private var liveRatio: Double?
@@ -198,7 +203,7 @@ struct PaneSplitView: View {
 // MARK: Panes
 
 struct PaneLeafView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     let tab: Tab
     let pane: LeafPane
 
@@ -208,22 +213,46 @@ struct PaneLeafView: View {
         // agent's terminal would swallow typing.
         let visible = vm.isVisibleTab(tab)
         let focused = vm.focusedPaneID == pane.id && visible
+        let launching = pane.agentID.map { vm.launchingAgents.contains($0) } ?? false
 
-        LiveTerminalPane(
-            session: vm.sessions.session(for: pane, in: tab),
-            isFocused: focused,
-            isRendering: visible
+        ZStack {
+            LiveTerminalPane(
+                session: vm.sessions.session(for: pane, in: tab),
+                agentID: pane.agentID,
+                isFocused: focused,
+                isRendering: visible
+            )
+            // A just-created agent's terminal boots behind an opaque cover:
+            // login-shell echo and pi's first paint are noise, not content.
+            // Visual only — hit testing passes through, and the surface
+            // keeps keyboard focus, so typing lands in pi's prompt.
+            if launching {
+                AgentLaunchOverlay()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .animation(
+            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? nil
+                : .easeOut(duration: 0.12),
+            value: launching
         )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tokens.terminalBg)
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture().onEnded { vm.focusedPaneID = pane.id })
     }
 }
 
+// AgentLaunchOverlay (the ASCII crook boot screen) lives in
+// AgentLaunchOverlay.swift.
+
 struct LiveTerminalPane: View {
     @ObservedObject var session: TerminalSessionStore.PaneSession
+    let agentID: AgentID?
     let isFocused: Bool
+    @ObservedObject private var piUpdates = PiUpdateManager.shared
     /// False for a mounted-but-hidden pane, which keeps its surface but must
     /// stop running a render loop.
     var isRendering: Bool = true
@@ -239,6 +268,10 @@ struct LiveTerminalPane: View {
                     PanePlaceholder(text: "starting session…")
                         .allowsHitTesting(false)
                 }
+                if agentID != nil, piUpdates.isOutdated {
+                    PiOutdatedOverlay()
+                        .allowsHitTesting(false)
+                }
             }
         case .failed(let reason):
             PanePlaceholder(text: "session unavailable · \(reason)")
@@ -252,7 +285,7 @@ struct LiveTerminalPane: View {
 /// connection. One pane, no splits: remote agents render their pi terminal
 /// only — auxiliary panes stay a host-side concern.
 struct RemoteAgentPane: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     let ref: RemoteAgentRef
 
     var body: some View {
@@ -267,7 +300,7 @@ struct RemoteAgentPane: View {
 }
 
 private struct RemoteAgentPaneContent: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     @ObservedObject var connection: RemoteHostStore.Connection
     let agentID: AgentID
 
@@ -307,7 +340,7 @@ private struct RemoteAgentPaneContent: View {
 }
 
 private struct RemotePaneTreeView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     @ObservedObject var connection: RemoteHostStore.Connection
     let ref: RemoteAgentRef
     let tab: Tab
@@ -324,7 +357,7 @@ private struct RemotePaneTreeView: View {
 }
 
 private struct RemotePaneLeafView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     @ObservedObject var connection: RemoteHostStore.Connection
     let leaf: LeafPane
 
@@ -343,7 +376,7 @@ private struct RemotePaneLeafView: View {
 }
 
 private struct RemotePaneSplitView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     @ObservedObject var connection: RemoteHostStore.Connection
     let ref: RemoteAgentRef
     let tab: Tab
@@ -440,7 +473,7 @@ struct PanePlaceholder: View {
 // MARK: Status line
 
 struct StatusLineView: View {
-    @ObservedObject var vm: ShepherdViewModel
+    var vm: ShepherdViewModel
     @ObservedObject private var keys = KeybindingsStore.shared
     @ObservedObject private var appearance = AppSettings.shared
     @State private var hoveringNewSpace = false

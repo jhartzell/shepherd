@@ -16,8 +16,17 @@ extension ShepherdViewModel {
             selectedAgentID: selectedAgentID,
             inspectingAgentID: inspectingAgentID,
             selectedShellID: selectedShellID,
-            remoteSelectionActive: selectedRemoteAgent != nil
+            remoteSelectionActive: selectedRemoteAgent != nil,
+            visitedTabIDs: visitedSpaceShellTabs
         )
+    }
+
+    /// Record the currently visible layout so it stays mounted after
+    /// selection moves on (space shell tabs mount lazily — see
+    /// `WorkspaceSelection`). Called by the workspace view on every
+    /// active-tab change, which covers all selection paths.
+    func noteActiveTabVisited() {
+        if let id = activeTabID { visitedSpaceShellTabs.insert(id) }
     }
 
     /// Every layout the workspace keeps mounted (see `WorkspaceSelection`).
@@ -193,6 +202,7 @@ extension ShepherdViewModel {
         }
 
         if let agentID = exitedAgentID {
+            endAgentLaunch(agentID)
             childRuns.clear(agent: agentID)
             state.agents.removeAll { $0.id == agentID }
             if selectedAgentID == agentID {
@@ -232,6 +242,27 @@ extension ShepherdViewModel {
         enqueuePersistence("agent rename") { try await $0.renameAgent(id, to: trimmed) }
     }
 
+    /// Confirmed Delete Worktree Agent: retire the agent, and optionally tear
+    /// down the worktree checkout + branch that Shepherd created for it. The
+    /// removal runs off-main after a short grace so the agent's processes
+    /// (whose cwd is inside the worktree) are gone first.
+    func deleteWorktreeAgent(_ id: AgentID, removeWorktree: Bool) {
+        guard let agent = state.agents.first(where: { $0.id == id }) else { return }
+        let branch = agent.worktreeBranch
+        let repo = state.spaces.first { $0.id == agent.spaceID }?.path
+        let worktree = agent.worktreePath
+        deleteAgent(id)
+        guard removeWorktree, let branch, let repo else { return }
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .milliseconds(500))
+            do {
+                try GitWorktree.remove(repo: repo, branch: branch, worktree: worktree)
+            } catch {
+                NSLog("Shepherd: worktree removal failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func deleteAgent(_ id: AgentID) {
         guard let agent = state.agents.first(where: { $0.id == id }),
               let tabIndex = state.tabs.firstIndex(where: { $0.id == agent.tabID }) else { return }
@@ -243,6 +274,7 @@ extension ShepherdViewModel {
             sessions.detachPane(leaf.id)
         }
 
+        endAgentLaunch(id)
         childRuns.clear(agent: id)
         state.agents.removeAll { $0.id == id }
         state.tabs.remove(at: tabIndex)
